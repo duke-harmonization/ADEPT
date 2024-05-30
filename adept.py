@@ -1,23 +1,16 @@
+import scipy
 from scipy.optimize import minimize
 import scipy.stats
 import torch
 import torch.optim as optim
 import torch.nn as nn
-import scipy
 import numpy as np
-import matplotlib.pyplot as plt
-from math import exp
-from node import Node
 import random
 from sksurv.nonparametric import kaplan_meier_estimator
-from copy import copy
 from copy import deepcopy
-# from evaluation import brier_score
 
-# from copy import deepcopy
 
-# torch.autograd.set_detect_anomaly(True)
-class CutpointModel(nn.Module):
+class ADEPT(nn.Module):
     def __init__(self,
                  X_train, t_train, s_train,
                  X_validation, t_validation, s_validation,
@@ -26,16 +19,14 @@ class CutpointModel(nn.Module):
                  n_cutpoints = 1, 
                  iterations = 1000,
                  batch_size = 64,
-                 prior_bool = True,
-                 prior_strength = 1,
+                 regularization_strength = 1,
                  hidden_size = 32,
-                 init_method="even",
+                 km_initialization = True,
                  weight_decay = 0,
                  learn_cutpoints=True,
-                 extra_bucket=False,
                  seed = 1978):       
         
-        super(CutpointModel, self).__init__()
+        super(ADEPT, self).__init__()
         torch.manual_seed(seed)
         random.seed(seed)
 
@@ -50,12 +41,8 @@ class CutpointModel(nn.Module):
         self.t_validation = torch.from_numpy(t_validation).float()
         self.s_validation = torch.from_numpy(s_validation).float()
 
-        
-        # if True: will add prior to loss
-        # if False: will add entropy to loss
-        self.prior_bool = prior_bool
-        # multiplier on prior/entropy
-        self.prior_strength = prior_strength
+        # multiplier on prior
+        self.regularization_strength = regularization_strength
         
         self.weight_decay = weight_decay
         
@@ -68,7 +55,6 @@ class CutpointModel(nn.Module):
         self.iterations = iterations
         self.batch_size = batch_size
         self.learn_cutpoints = learn_cutpoints
-        self.extra_bucket = extra_bucket
         
         self.train_loss = [0] * self.iterations
         self.validation_loss = [0] * self.iterations
@@ -76,14 +62,13 @@ class CutpointModel(nn.Module):
                 
         
         # set up parameters
-        self.cutpoint0 = self.cutpoint_init_even(self.n_cutpoints) if init_method=="even" else self.cutpoint_init_percentile(self.n_cutpoints, self.t_train, self.s_train)
+        self.cutpoint0 =  self.cutpoint_init_percentile(self.n_cutpoints, self.t_train, self.s_train) if km_initialization else self.cutpoint_init_even(self.n_cutpoints)
         
         
         
         # if cut points are being learned add them to the list of parameters to optimize
         if self.learn_cutpoints:
 
-#             self.cutpoints = nn.Parameter(torch.tensor([cutpoint for cutpoint in self.cutpoint0], requires_grad=True))
             self.cutpoint_params = nn.ParameterList([nn.Parameter(torch.tensor(cutpoint), requires_grad=True) for cutpoint in self.cutpoint0])
             self.cutpoints = list(self.cutpoint_params)
 
@@ -93,7 +78,7 @@ class CutpointModel(nn.Module):
 
                 
         p = self.X_train.shape[1]
-        b = (n_cutpoints + 1) + self.extra_bucket
+        b = (n_cutpoints + 1)
         
         
         layer1 = torch.nn.Linear(p, hidden_size)
@@ -115,7 +100,6 @@ class CutpointModel(nn.Module):
         self.best_cutpoints = []
         self.best_loss = 1e8
         self.best_iteration = 0
-#         self.best_ibs = 1e8
 
     
     # evenly spaced cutpoints
@@ -164,16 +148,14 @@ class CutpointModel(nn.Module):
     def F(self, t, probs_tensor, cutpoints, smooth=False, temp=1e-2):
                
 
-        t_tensor = torch.reshape(torch.tensor(t), (len(t),1))
+        t_tensor = torch.reshape(t, (len(t),1))
         
         cutpoints_tensor = torch.cat((torch.tensor([0]), torch.tensor(cutpoints), torch.tensor([1])))
     
         if smooth:
         
             progress = torch.subtract( t_tensor, cutpoints_tensor[:-1] ) / torch.diff(cutpoints_tensor)
-#             print(progress)
             y_complete_bins = self.softplus(progress, tau=temp)
-#             print(y_complete_bins)
             
             y_complete_bins = self.softplus(-1 * (y_complete_bins - 1), tau=temp)
 
@@ -193,17 +175,15 @@ class CutpointModel(nn.Module):
     
      
         
-    def multinomial_loss(self, X, t, s, prior_bool, prior_strength, cutpoint_bool):
+    def multinomial_loss(self, X, t, s, regularization_strength, cutpoint_bool):
         
         
         t_scaled = (t - self.min_t) / (self.max_t - self.min_t)
-#         t_scaled = (t - min(t)) / (max(t) - min(t))
 
         likelihood = 0
 
         pred = self.predict(X)   
         cutpoints = self.cutpoints
-#         print(cutpoints)
 
         
         if all([i == 1 for i in cutpoint_bool]):
@@ -215,9 +195,7 @@ class CutpointModel(nn.Module):
                 if cutpoint_bool[i]:
                     new_cutpoints[counter] = self.cutpoints[i]
                     counter += 1
-#                     cutpoints = torch.cat(cutpoints[0:i], cutpoints[i+1:])
-#                     del(cutpoints[i])
-#                     i -= 1
+
 
 
             new_pred = torch.zeros(pred.size()[0], sum(cutpoint_bool)+1)
@@ -232,31 +210,13 @@ class CutpointModel(nn.Module):
                 else:
                     new_pred[:,counter] += pred[:,i+1]
 
-#             new_pred = torch.zeros(sum(cutpoint_bool)+1)
-
-#             counter = 0
-#             new_pred[0] = pred[0][0]
-
-#             for i in range(self.n_cutpoints):
-#                 if cutpoint_bool[i]:
-#                     counter += 1
-#                     new_pred[counter] = pred[0][i+1]
-#                 else:
-#                     new_pred[counter] += pred[0][i+1]
 
 
             cutpoints = new_cutpoints
             pred = new_pred
 
-#         print(cutpoints)
-#         print(pred)
-
-        if self.extra_bucket:
-            pred = pred[:, 0:-1]
 
         F_t= self.F( t_scaled, pred, cutpoints, smooth=True, temp=self.sigmoid_temperature)
-
-#         print(F_t)
 
         # normalize by interval length
         f_t = torch.divide(pred, 
@@ -272,10 +232,6 @@ class CutpointModel(nn.Module):
         ll_event = torch.unsqueeze(s,0) * ll_event
 
 
-#         ll_censored = F_t * left_boundary * right_boundary
-#         ll_censored = torch.sum(ll_censored, axis=1)
-#         ll_censored = torch.log(ll_censored)
-#         ll_censored =  (1 - torch.unsqueeze(s,0)) * ll_censored
 
         ll_censored = F_t
         ll_censored = torch.log(ll_censored)
@@ -302,32 +258,22 @@ class CutpointModel(nn.Module):
 
 
         # if prior
-        if prior_strength > 0:
-            try:
-                if prior_bool:
-                     # prior loop
-                    prior = 0
-                    for lb, curr, rb in zip([0] + cutpoints[:-1], cutpoints, cutpoints[1:] + [1]):
-                        current_cutpoint = (curr - lb) / (rb - lb)
+        if regularization_strength > 0:
+             # prior loop
+            prior = 0
+            for lb, curr, rb in zip([0] + cutpoints[:-1], cutpoints, cutpoints[1:] + [1]):
+                current_cutpoint = (curr - lb) / (rb - lb)
 
-                        if not self.learn_cutpoints:
-                            current_cutpoint = torch.tensor(current_cutpoint)
+                if not self.learn_cutpoints:
+                    current_cutpoint = torch.tensor(current_cutpoint)
 
-                        prior += -1 * prior_strength * torch.distributions.Beta(torch.tensor(1.5), torch.tensor(1.5)).log_prob(current_cutpoint)
-                        regularization = prior
+                prior += -1 * regularization_strength * torch.distributions.Beta(torch.tensor(1.5), torch.tensor(1.5)).log_prob(current_cutpoint)
+                regularization = prior
 
-                    nll += prior
+                nll += prior
 
-                # else use entropy
-                else:
-                    # minimizing the negative entropy (i.e. maximizing entropy)
-                    # this helps ensure that there is a fairly even spread of data across all of the buckets
-                    entropy = -1  * prior_strength * torch.sum(approx_p * torch.log(approx_p))
-                    nll -= entropy
-                    regularization = entropy
-            except Exception as e:
-#                 print(e)
-                pass
+
+
 
         return nll, regularization
 
@@ -355,8 +301,8 @@ class CutpointModel(nn.Module):
             
             
             
-#             if (iteration_num+1) % 10 == 0:
-#                 print(f"iteration:\t{iteration_num+1} / {self.iterations}")
+            if (iteration_num+1) % 10 == 0:
+                print(f"iteration:\t{iteration_num+1} / {self.iterations}")
             # minibatching
             
             permutation = torch.randperm(self.X_train.shape[0])
@@ -374,7 +320,7 @@ class CutpointModel(nn.Module):
                 
                 
                     
-                loss, _ = self.multinomial_loss(batch_X, batch_t, batch_s, self.prior_bool, self.prior_strength, cutpoint_bool)
+                loss, _ = self.multinomial_loss(batch_X, batch_t, batch_s, self.regularization_strength, cutpoint_bool)
                 
                 loss.backward(retain_graph=True)
 
@@ -389,8 +335,7 @@ class CutpointModel(nn.Module):
             self.validation_loss[iteration_num] = self.multinomial_loss(self.X_validation,
                                                                            self.t_validation,
                                                                            self.s_validation,
-                                                                           self.prior_bool,
-                                                                           self.prior_strength,
+                                                                           self.regularization_strength,
                                                                            cutpoint_bool)[0].item()
             
             # if the loss from this epoch is the best loss, save the model and cut points
@@ -403,10 +348,6 @@ class CutpointModel(nn.Module):
                 pred_validation = self.predict(self.X_validation).detach().numpy()
                 bin_end_times = [x.item() for x in self.cutpoints] + [1]
                 integrated = True
-#                 self.best_ibs = brier_score(self.s_train, self.t_train, self.s_validation, self.t_validation, pred_validation, bin_end_times, integrated)
-            
-#             print(f"{iteration_num}\tcutpoints:\t{self.cutpoints}")
-                    
 
             if self.temperature_decay and \
                 iteration_num > 4 and \
@@ -415,7 +356,6 @@ class CutpointModel(nn.Module):
                 (self.validation_loss[iteration_num - 3] < self.validation_loss[iteration_num - 2]) :
 
                 self.sigmoid_temperature /= 2
-#                 print(f"LOWERING THE TEMPERATURE\titeration:\t{iteration_num}:\tnew temp:\t{self.sigmoid_temperature}")
                 self.decay_iterations.append(iteration_num)
                 self.temperature_history.append(self.sigmoid_temperature)
                 
@@ -426,8 +366,9 @@ class CutpointModel(nn.Module):
 
         # set all parameters to best parameters
         print(f"Best validation loss achieved at iteration:\t{self.best_iteration}") 
-        self.layers = copy(self.best_layers)
-        self.cutpoints = copy(self.best_cutpoints)
+        self.layers = deepcopy(self.best_layers)
+        self.cutpoints = deepcopy(self.best_cutpoints)
+
 
     def predict(self, X_test):
         
@@ -437,9 +378,7 @@ class CutpointModel(nn.Module):
             X_test = torch.from_numpy(X_test).float()
         
         pred = self.layers(X_test)
-        
-        if self.extra_bucket:
-            pred = pred[:, 0:-1]
+
         
         
         # if input is numpy array convert output back to numpy array
